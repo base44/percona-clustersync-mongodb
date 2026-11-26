@@ -1,0 +1,71 @@
+---
+name: Image
+
+# Builds the pcsm image from packaging/docker/Dockerfile.
+#
+# - Run manually ("Run workflow", on any branch) to publish it to the GitHub Container
+#   Registry as ghcr.io/<owner>/<repository>, tagged with the short commit and the branch name.
+# - On pull requests that touch the image files it only builds, to prove the build works.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - packaging/docker/**
+      - .dockerignore
+      - .github/workflows/image.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: Build image
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      PUBLISH: ${{ github.event_name == 'workflow_dispatch' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Log in to the GitHub Container Registry
+        if: env.PUBLISH == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      # Plain docker commands rather than the docker/* actions, so the workflow also runs
+      # where the Actions policy allows only GitHub-owned actions.
+      - name: Build
+        run: |
+          image="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          commit="${GITHUB_SHA::7}"
+          branch="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+
+          args=(
+            --file packaging/docker/Dockerfile
+            --platform linux/amd64,linux/arm64
+            --build-arg "GIT_COMMIT=$commit"
+            --build-arg "GIT_BRANCH=$branch"
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+            --label "org.opencontainers.image.revision=$GITHUB_SHA"
+            --tag "$image:$commit"
+            --tag "$image:${branch//\//-}"
+          )
+          if [ "$PUBLISH" = true ]; then
+            args+=(--push)
+          fi
+
+          # The default builder cannot build two platforms at once.
+          docker buildx create --use > /dev/null
+          docker buildx build "${args[@]}" .
+
+          if [ "$PUBLISH" = true ]; then
+            echo "Published $image:$commit and $image:${branch//\//-}" >> "$GITHUB_STEP_SUMMARY"
+          fi
