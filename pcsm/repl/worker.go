@@ -17,6 +17,11 @@ import (
 	"github.com/percona/percona-clustersync-mongodb/pcsm/catalog"
 )
 
+// errRefetchAbandoned reports that a source read for an event was cut short because the
+// run was canceled. Like a canceled bulk write it is abandonment, not a replication failure:
+// the event is at or after the resume floor and replays on resume.
+var errRefetchAbandoned = errors.New("refetch abandoned")
+
 // routedEvent bundles a change event with its pre-resolved namespace.
 // Namespace is resolved in the dispatcher using uuidMap before routing to worker.
 // This includes enriched fields like Sharded and ShardKey from the catalog.
@@ -268,7 +273,14 @@ func (w *worker) run(ctx context.Context) {
 
 			// Drain all buffered events routed before the barrier was requested.
 			if !w.drainRoutedEvents(ctx) {
-				w.barrierDone <- errors.Wrap(w.writerErr, "writer failed during barrier drain")
+				drainErr := w.writerErr
+				if drainErr == nil {
+					// A refetch abandoned by cancellation is not reported, but the
+					// barrier over it must not report a successful drain.
+					drainErr = ctx.Err()
+				}
+
+				w.barrierDone <- errors.Wrap(drainErr, "writer failed during barrier drain")
 
 				return
 			}
@@ -325,6 +337,12 @@ func (w *worker) run(ctx context.Context) {
 
 			err := w.addToCurrentBulk(ctx, event)
 			if err != nil {
+				if errors.Is(err, errRefetchAbandoned) {
+					lg.Debug("Worker stopped (context done during refetch)")
+
+					return
+				}
+
 				w.reportError(err)
 
 				return
@@ -431,6 +449,12 @@ func (w *worker) refetchUpdatedDoc(ctx context.Context, event *routedEvent, upda
 	}
 
 	if err != nil {
+		// Driver errors may not retain the context error. Once this run is
+		// canceled, a failed read is abandonment.
+		if ctx.Err() != nil {
+			return nil, errors.Join(errRefetchAbandoned, ctx.Err())
+		}
+
 		return nil, errors.Wrap(err, "refetch from source")
 	}
 
@@ -503,7 +527,9 @@ func (w *worker) drainRoutedEvents(ctx context.Context) bool {
 		case event := <-w.routedEventCh:
 			err := w.addToCurrentBulk(ctx, event)
 			if err != nil {
-				w.reportError(err)
+				if !errors.Is(err, errRefetchAbandoned) {
+					w.reportError(err)
+				}
 
 				return false
 			}
