@@ -1,11 +1,13 @@
 package repl //nolint:testpackage
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
@@ -973,6 +975,29 @@ func TestExtractRecoverableUpdateTarget_ClientBulk(t *testing.T) {
 		assert.Equal(t, filter, gotFilter)
 	})
 
+	t.Run("DollarPrefixedFieldName on update at idx 1", func(t *testing.T) {
+		t.Parallel()
+
+		bulkErr := mongo.ClientBulkWriteException{
+			WriteErrors: map[int]mongo.WriteError{
+				1: {Index: 1, Code: errCodeDollarPrefixedFieldName, Message: "The dollar ($) prefixed field"},
+			},
+		}
+
+		idx, gotNS, gotFilter := cbw.extractRecoverableUpdateTarget(bulkErr, writes)
+		assert.Equal(t, 1, idx)
+		assert.Equal(t, ns, gotNS)
+		assert.Equal(t, filter, gotFilter)
+
+		// The same error on a replace is not an update recovery.
+		bulkErr.WriteErrors = map[int]mongo.WriteError{
+			0: {Index: 0, Code: errCodeDollarPrefixedFieldName, Message: "The dollar ($) prefixed field"},
+		}
+		idx, _, gotFilter = cbw.extractRecoverableUpdateTarget(bulkErr, writes)
+		assert.Equal(t, -1, idx)
+		assert.Nil(t, gotFilter)
+	})
+
 	t.Run("non-recoverable error returns -1", func(t *testing.T) {
 		t.Parallel()
 
@@ -1143,4 +1168,80 @@ func TestExtractRecoverableUpdateTarget_CollectionBulk(t *testing.T) {
 		assert.Equal(t, -1, idx)
 		assert.Nil(t, gotFilter)
 	})
+}
+
+func TestHasDollarPrefixedField(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		doc  bson.D
+		want bool
+	}{
+		{"top-level field", bson.D{{"_id", 1}, {"a", 1}, {"$price", 2}}, true},
+		{"nested field only", bson.D{{"_id", 1}, {"rules", bson.D{{"$or", bson.A{}}}}}, false},
+		{"dollar inside the name", bson.D{{"_id", 1}, {"a$b", 2}}, false},
+		{"no such field", bson.D{{"_id", 1}, {"a.b", 2}}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			raw, err := bson.Marshal(tt.doc)
+			require.NoError(t, err)
+
+			assert.Equal(t, tt.want, hasDollarPrefixedField(bson.Raw(raw)))
+		})
+	}
+}
+
+// A replacement with a top-level "$"-prefixed field fails in replaceOne whatever the
+// collection: code 52 on an unsharded one, code 12 on a sharded one. Both bulk writers
+// must hand it to the delete+insert fallback.
+func TestBulkWrite_ReplacementWithDollarPrefixedFieldFallsBack(t *testing.T) {
+	t.Parallel()
+
+	withDollar, err := bson.Marshal(bson.D{{"_id", 1}, {"a", 1}, {"$price", 2}})
+	require.NoError(t, err)
+
+	plain, err := bson.Marshal(bson.D{{"_id", 1}, {"a", 1}})
+	require.NoError(t, err)
+
+	for _, code := range []int{errCodeDollarPrefixedFieldName, 12} {
+		for _, tt := range []struct {
+			name        string
+			replacement bson.Raw
+			want        int
+		}{
+			{"dollar-prefixed field", withDollar, 1},
+			{"plain document", plain, -1},
+		} {
+			t.Run(fmt.Sprintf("code %d %s", code, tt.name), func(t *testing.T) {
+				t.Parallel()
+
+				clientWrites := []mongo.ClientBulkWrite{
+					{Model: &mongo.ClientDeleteOneModel{Filter: bson.D{{"_id", 0}}}},
+					{Model: &mongo.ClientReplaceOneModel{Replacement: tt.replacement}},
+				}
+				clientErr := mongo.ClientBulkWriteException{
+					WriteErrors: map[int]mongo.WriteError{1: {Index: 1, Code: code}},
+				}
+
+				idx, _ := newClientBulkWriter(100, false, nil).extractDuplicateKeyReplacement(clientErr, clientWrites)
+				assert.Equal(t, tt.want, idx)
+
+				collWrites := []mongo.WriteModel{
+					&mongo.DeleteOneModel{Filter: bson.D{{"_id", 0}}},
+					&mongo.ReplaceOneModel{Replacement: tt.replacement},
+				}
+				collErr := mongo.BulkWriteException{WriteErrors: []mongo.BulkWriteError{
+					{Index: 1, Code: code},
+				}}
+
+				idx, _ = newCollectionBulkWriter(100, false, nil).extractReplacementFallback(collErr, collWrites)
+				assert.Equal(t, tt.want, idx)
+			})
+		}
+	}
 }
