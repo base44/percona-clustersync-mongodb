@@ -91,6 +91,25 @@ func TestHashDocumentKey_Deterministic(t *testing.T) {
 	}
 }
 
+// A sharded collection's documentKey changes when an update modifies a shard key value in
+// place. The document's events must stay on one worker, or their order is lost.
+func TestHashDocumentKey_ShardKeyValueDoesNotChangeWorker(t *testing.T) {
+	t.Parallel()
+
+	for _, numWorkers := range []int{2, 4, 8, 16} {
+		for i := range 200 {
+			before, err := bson.Marshal(bson.D{{"_id", i}, {"region", "eu"}})
+			require.NoError(t, err)
+
+			after, err := bson.Marshal(bson.D{{"_id", i}, {"region", "us"}})
+			require.NoError(t, err)
+
+			require.Equal(t, hashDocumentKey(before, numWorkers), hashDocumentKey(after, numWorkers),
+				"_id %d with %d workers", i, numWorkers)
+		}
+	}
+}
+
 func TestHashNamespace_Deterministic(t *testing.T) {
 	t.Parallel()
 
