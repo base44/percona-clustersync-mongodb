@@ -801,6 +801,15 @@ func (p *workerPool) NumWorkers() int {
 // hashDocumentKey computes a consistent hash of the document key
 // and returns a worker index in range [0, numWorkers).
 func hashDocumentKey(key []byte, numWorkers int) int {
+	// Hash _id alone. The documentKey of a sharded collection also holds the shard key
+	// values, and those change when an update modifies a shard key value in place. Hashing
+	// them would route the document's later events to another worker and lose their order
+	// relative to the earlier ones.
+	id, err := bson.Raw(key).LookupErr("_id")
+	if err == nil {
+		key = id.Value
+	}
+
 	h := fnv.New32a()
 	h.Write(key)
 
