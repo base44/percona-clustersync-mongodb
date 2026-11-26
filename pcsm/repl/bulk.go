@@ -55,6 +55,11 @@ const (
 	// errCodeNonExistentPath - a required path does not exist on the target
 	// document (e.g. $rename source missing, certain $pop/$pull cases).
 	errCodeNonExistentPath = 29
+	// errCodeDollarPrefixedFieldName - "The dollar ($) prefixed field '$x' in '$x'
+	// is not allowed in the context of an update's replacement document". The
+	// server accepts a top-level field name that starts with "$" on insert, but
+	// not in $set. See hasDollarPrefixedField for replacements.
+	errCodeDollarPrefixedFieldName = 52
 	// errCodeShardKeyNotFound - an upsert filter lacks the target shard key.
 	// A replayed insert can predate sharding already applied on the target.
 	errCodeShardKeyNotFound = 61
@@ -64,7 +69,8 @@ const (
 // failure that is recoverable by refetching the document from source and
 // applying it as an upserting replaceOne on target.
 func isRecoverableUpdateError(code int) bool {
-	return code == errCodePathNotViable || code == errCodeNonExistentPath
+	return code == errCodePathNotViable || code == errCodeNonExistentPath ||
+		code == errCodeDollarPrefixedFieldName
 }
 
 // updateOps holds the result of building update operations from a change stream event.
@@ -211,7 +217,9 @@ func (cbw *clientBulkWrite) doWithRetry(
 }
 
 // extractDuplicateKeyReplacement checks if the error is a duplicate key error on a ReplaceOne
-// operation and returns the index and replacement document. Returns -1, nil if not applicable.
+// operation, or any write error on a ReplaceOne whose replacement the server cannot accept
+// (see hasDollarPrefixedField), and returns the index and replacement document. Returns
+// -1, nil if not applicable.
 // This writer requires MongoDB 8.0+, which routes single-document upserts without
 // a full shard key; the pre-8.0 ShardKeyNotFound fallback belongs to collectionBulkWrite.
 func (cbw *clientBulkWrite) extractDuplicateKeyReplacement(
@@ -232,13 +240,17 @@ func (cbw *clientBulkWrite) extractDuplicateKeyReplacement(
 		}
 	}
 
-	firstErr := bwe.WriteErrors[minIdx]
-	if !mongo.IsDuplicateKeyError(firstErr) || minIdx < 0 || minIdx >= len(writes) {
+	if minIdx < 0 || minIdx >= len(writes) {
 		return -1, nil
 	}
 
+	//nolint:gosec // G602 false positive: minIdx is range-checked just above.
 	replaceModel, ok := writes[minIdx].Model.(*mongo.ClientReplaceOneModel)
 	if !ok {
+		return -1, nil
+	}
+
+	if !mongo.IsDuplicateKeyError(bwe.WriteErrors[minIdx]) && !hasDollarPrefixedField(replaceModel.Replacement) {
 		return -1, nil
 	}
 
@@ -527,7 +539,8 @@ func (cbw *collectionBulkWrite) doWithRetry(
 }
 
 // extractReplacementFallback finds a replacement that can be reapplied with
-// delete+insert. ShardKeyNotFound is recoverable only for upserting inserts:
+// delete+insert: a duplicate key, or a replacement the server cannot accept (see
+// hasDollarPrefixedField). ShardKeyNotFound is recoverable only for upserting inserts:
 // their historical documentKey can omit a shard key the target now requires,
 // even when the restored catalog still describes an unsharded collection.
 func (cbw *collectionBulkWrite) extractReplacementFallback(
@@ -549,7 +562,7 @@ func (cbw *collectionBulkWrite) extractReplacementFallback(
 		return -1, nil
 	}
 
-	if !mongo.IsDuplicateKeyError(firstErr) &&
+	if !mongo.IsDuplicateKeyError(firstErr) && !hasDollarPrefixedField(replaceModel.Replacement) &&
 		(firstErr.Code != errCodeShardKeyNotFound || replaceModel.Upsert == nil || !*replaceModel.Upsert) {
 		return -1, nil
 	}
@@ -785,10 +798,8 @@ func handleRecoverableUpdateError(
 
 	sourceColl := source.Database(ns.Database).Collection(ns.Collection)
 
-	var doc bson.D
-
-	err := mdb.RunWithRetry(ctx, func(ctx context.Context) error {
-		return sourceColl.FindOne(ctx, filter).Decode(&doc) //nolint:wrapcheck
+	doc, err := mdb.RunWithRetryVal(ctx, func(ctx context.Context) (bson.Raw, error) {
+		return sourceColl.FindOne(ctx, filter).Raw() //nolint:wrapcheck
 	}, mdb.DefaultRetryInterval, mdb.DefaultMaxRetries)
 	if errors.Is(err, mongo.ErrNoDocuments) {
 		// Doc deleted on source between the change event and the refetch.
@@ -803,6 +814,11 @@ func handleRecoverableUpdateError(
 
 	log.Ctx(ctx).With(log.NS(ns.Database, ns.Collection)).
 		Infof("Recoverable-update recovery: replacing target from source for %v", filter)
+
+	if hasDollarPrefixedField(doc) {
+		// replaceOne rejects such a document; an insert accepts it.
+		return replaceWithDeleteInsert(ctx, targetColl, doc, useSimpleCollation)
+	}
 
 	replaceOpts := options.Replace().SetUpsert(true)
 	if useSimpleCollation {
@@ -819,6 +835,27 @@ func handleRecoverableUpdateError(
 	}
 
 	return nil
+}
+
+// hasDollarPrefixedField reports whether doc, a document as it comes from a change event
+// or from source, has a top-level field whose name starts with "$". The server accepts
+// such a document on insert but never as a replacement: replaceOne fails with
+// DollarPrefixedFieldName, or with "mixed $operator and non-$operator style fields" on a
+// sharded collection. It has to be applied with delete+insert instead.
+func hasDollarPrefixedField(doc any) bool {
+	raw, ok := doc.(bson.Raw)
+	if !ok {
+		return false
+	}
+
+	elems, _ := raw.Elements()
+	for _, elem := range elems {
+		if strings.HasPrefix(elem.Key(), "$") {
+			return true
+		}
+	}
+
+	return false
 }
 
 // deleteTargetAfterSourceMissing performs an idempotent DeleteOne on the
