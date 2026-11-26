@@ -116,6 +116,23 @@ make metrics-up; make metrics-down
 
 ## PROJECT NOTES
 
+### Public fork
+
+This repository is a public fork of `percona/percona-clustersync-mongodb`. Everything
+pushed here is visible to anyone: commits and their author addresses, branch names, pull
+request titles and descriptions, comments, CI logs and workflow artifacts.
+
+- Never put private data in it: no credentials, tokens or connection strings; no internal
+  hostnames, account IDs or URLs; no organization, product, customer or person names; no
+  schema, collection or field names copied from a real system; no data taken from a real
+  system, however small.
+- Keep everything generic. Describe a problem by its shape (a collection sharded on
+  `{_id: "hashed", region: 1}`), not by where it was found. Use neutral placeholder names
+  in code, tests, commit messages and pull requests.
+- Commit with an address that does not identify an employer, for example the
+  GitHub-provided `noreply` address.
+- When unsure whether something is private, leave it out.
+
 ### Regeneration
 
 Regenerate the baseline above the marker; preserve and reconcile this tail separately.
