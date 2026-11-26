@@ -798,9 +798,7 @@ func handleRecoverableUpdateError(
 
 	sourceColl := source.Database(ns.Database).Collection(ns.Collection)
 
-	doc, err := mdb.RunWithRetryVal(ctx, func(ctx context.Context) (bson.Raw, error) {
-		return sourceColl.FindOne(ctx, filter).Raw() //nolint:wrapcheck
-	}, mdb.DefaultRetryInterval, mdb.DefaultMaxRetries)
+	doc, targetFilter, err := findSourceDoc(ctx, sourceColl, filter)
 	if errors.Is(err, mongo.ErrNoDocuments) {
 		// Doc deleted on source between the change event and the refetch.
 		// Delete on target idempotently; the eventual delete event from the
@@ -826,7 +824,7 @@ func handleRecoverableUpdateError(
 	}
 
 	err = mdb.RunWithRetry(ctx, func(ctx context.Context) error {
-		_, inner := targetColl.ReplaceOne(ctx, filter, doc, replaceOpts)
+		_, inner := targetColl.ReplaceOne(ctx, targetFilter, doc, replaceOpts)
 
 		return inner //nolint:wrapcheck
 	}, mdb.DefaultRetryInterval, mdb.DefaultMaxRetries)
@@ -835,6 +833,38 @@ func handleRecoverableUpdateError(
 	}
 
 	return nil
+}
+
+// findSourceDoc reads from source the document that a change event's documentKey refers to.
+//
+// For a sharded collection the documentKey holds the shard key values the document had
+// before the event. When a later update changed a shard key value in place, the documentKey
+// no longer matches and the document is looked up by _id alone, so that it is not mistaken
+// for a deleted one. findSourceDoc returns the document together with the filter that
+// selects its copy on target: the documentKey, or {_id} when only the _id lookup found it.
+// The error is mongo.ErrNoDocuments when the document no longer exists on source.
+func findSourceDoc(ctx context.Context, sourceColl *mongo.Collection, documentKey bson.D) (bson.Raw, bson.D, error) {
+	find := func(filter bson.D) (bson.Raw, error) {
+		return mdb.RunWithRetryVal(ctx, func(ctx context.Context) (bson.Raw, error) {
+			return sourceColl.FindOne(ctx, filter).Raw() //nolint:wrapcheck
+		}, mdb.DefaultRetryInterval, mdb.DefaultMaxRetries)
+	}
+
+	doc, err := find(documentKey)
+	if !errors.Is(err, mongo.ErrNoDocuments) || len(documentKey) == 1 {
+		return doc, documentKey, err
+	}
+
+	for _, elem := range documentKey {
+		if elem.Key == "_id" {
+			idOnly := bson.D{elem}
+			doc, err = find(idOnly)
+
+			return doc, idOnly, err
+		}
+	}
+
+	return nil, documentKey, err
 }
 
 // hasDollarPrefixedField reports whether doc, a document as it comes from a change event

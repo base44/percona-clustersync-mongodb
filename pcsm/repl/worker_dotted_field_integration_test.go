@@ -129,3 +129,92 @@ func TestWorker_AddToCurrentBulk_RefetchesDocumentForDottedFieldName(t *testing.
 		assert.Empty(t, bw.updates)
 	})
 }
+
+// A sharded collection's documentKey carries the shard key values from before the event.
+// When a shard key value was changed in place afterwards, the document must still be found
+// (by _id) and must not be treated as deleted.
+//
+//nolint:paralleltest // MongoDB testcontainers are serialized to avoid Docker resource contention.
+func TestWorker_AddToCurrentBulk_RefetchesDocumentAfterShardKeyChange(t *testing.T) {
+	runReplIntegrationTest(t, func(ctx context.Context) {
+		// Given a document whose shard key field no longer has the value in the documentKey
+		source, err := mongo.Connect(
+			options.Client().
+				ApplyURI(newReplTestReplicaSet(ctx, t)).
+				SetServerSelectionTimeout(30 * time.Second).
+				SetReadConcern(readconcern.Majority()).
+				SetWriteConcern(writeconcern.Majority()),
+		)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			disconnectReplTestClient(t, source)
+		})
+
+		ns := catalog.Namespace{Database: "dotted_field_test", Collection: "documents"}
+		coll := source.Database(ns.Database).Collection(ns.Collection)
+
+		_, err = coll.InsertOne(ctx, bson.D{
+			{"_id", 1},
+			{"region", "new"},
+			{"$price", 2},
+			{"files", bson.D{{"main.ts", "v2"}}},
+		})
+		require.NoError(t, err)
+
+		clusterTime, err := mdb.AdvanceClusterTime(ctx, source)
+		require.NoError(t, err)
+
+		staleKey := bson.D{{"_id", int32(1)}, {"region", "old"}}
+		newEvent := func() *routedEvent {
+			raw, err := bson.Marshal(bson.D{
+				{"documentKey", staleKey},
+				{"updateDescription", bson.D{
+					{"updatedFields", bson.D{{"files.main.ts", "v2"}}},
+					{"disambiguatedPaths", bson.D{{"files.main.ts", bson.A{"files", "main.ts"}}}},
+				}},
+			})
+			require.NoError(t, err)
+
+			return &routedEvent{ns: ns, change: &ChangeEvent{
+				EventHeader: EventHeader{OperationType: Update, Namespace: ns, ClusterTime: clusterTime},
+				RawData:     raw,
+			}}
+		}
+
+		bw := &recordingBulkWriter{}
+		w := &worker{source: source, currentBulkWrite: bw}
+
+		// When
+		require.NoError(t, w.addToCurrentBulk(ctx, newEvent()))
+
+		// Then the document replaces its target copy, selected by _id alone
+		require.Len(t, bw.replaces, 1)
+		assert.Empty(t, bw.deletes)
+
+		var targetFilter, replaced bson.D
+		require.NoError(t, bson.Unmarshal(bw.replaces[0].DocumentKey, &targetFilter))
+		require.NoError(t, bson.Unmarshal(bw.replaces[0].FullDocument, &replaced))
+		assert.Equal(t, bson.D{{"_id", int32(1)}}, targetFilter)
+		assert.Equal(t, "new", replaced[1].Value)
+
+		// And the recovery of a failed update finds it the same way. Its top-level
+		// "$price" field cannot go through replaceOne, so it is deleted and inserted.
+		target := source.Database(ns.Database).Collection("target")
+		_, err = target.InsertOne(ctx, bson.D{{"_id", 1}, {"region", "old"}})
+		require.NoError(t, err)
+		require.NoError(t, handleRecoverableUpdateError(ctx, source, target, ns, staleKey, false))
+
+		var onTarget bson.D
+		require.NoError(t, target.FindOne(ctx, bson.D{{"_id", 1}}).Decode(&onTarget))
+		assert.Equal(t, replaced, onTarget)
+
+		// When the document is gone from source, it is deleted on target
+		_, err = coll.DeleteOne(ctx, bson.D{{"_id", 1}})
+		require.NoError(t, err)
+		require.NoError(t, w.addToCurrentBulk(ctx, newEvent()))
+
+		require.Len(t, bw.deletes, 1)
+		assert.Equal(t, staleKey, bw.deletes[0].DocumentKey)
+		assert.Len(t, bw.replaces, 1)
+	})
+}

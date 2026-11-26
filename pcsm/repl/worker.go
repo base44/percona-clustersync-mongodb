@@ -13,7 +13,6 @@ import (
 
 	"github.com/percona/percona-clustersync-mongodb/errors"
 	"github.com/percona/percona-clustersync-mongodb/log"
-	"github.com/percona/percona-clustersync-mongodb/mdb"
 	"github.com/percona/percona-clustersync-mongodb/metrics"
 	"github.com/percona/percona-clustersync-mongodb/pcsm/catalog"
 )
@@ -404,15 +403,12 @@ func (w *worker) addToCurrentBulk(ctx context.Context, event *routedEvent) error
 // The read waits for the event's clusterTime (afterClusterTime) and uses the client's
 // majority read concern, so the fetched document is never older than the event. It can be
 // newer: later events for the same document are then replayed over it, the same way they
-// are replayed over a document copied by the initial sync.
+// are replayed over a document copied by the initial sync. A document whose shard key value
+// was changed in place since the event is found by _id (see findSourceDoc) and replaces its
+// target copy, which is still stored under the old shard key value.
 func (w *worker) refetchUpdatedDoc(ctx context.Context, event *routedEvent, update *UpdateEvent) (any, error) {
 	if w.source == nil {
 		return nil, errors.New("refetch of updated document requires source client")
-	}
-
-	documentKey, err := bson.Marshal(update.DocumentKey)
-	if err != nil {
-		return nil, errors.Wrap(err, "marshal documentKey")
 	}
 
 	sess, err := w.source.StartSession()
@@ -428,9 +424,7 @@ func (w *worker) refetchUpdatedDoc(ctx context.Context, event *routedEvent, upda
 
 	coll := w.source.Database(event.ns.Database).Collection(event.ns.Collection)
 
-	doc, err := mdb.RunWithRetryVal(ctx, func(ctx context.Context) (bson.Raw, error) {
-		return coll.FindOne(mongo.NewSessionContext(ctx, sess), update.DocumentKey).Raw() //nolint:wrapcheck
-	}, mdb.DefaultRetryInterval, mdb.DefaultMaxRetries)
+	doc, targetFilter, err := findSourceDoc(mongo.NewSessionContext(ctx, sess), coll, update.DocumentKey)
 	if errors.Is(err, mongo.ErrNoDocuments) {
 		// Deleted on source after this update. The delete event that follows is a no-op.
 		return DeleteEvent{DocumentKey: update.DocumentKey}, nil
@@ -442,6 +436,11 @@ func (w *worker) refetchUpdatedDoc(ctx context.Context, event *routedEvent, upda
 
 	log.Ctx(ctx).With(log.NS(event.ns.Database, event.ns.Collection)).
 		Debugf("Update of a dotted field name: replacing target from source for %v", update.DocumentKey)
+
+	documentKey, err := bson.Marshal(targetFilter)
+	if err != nil {
+		return nil, errors.Wrap(err, "marshal documentKey")
+	}
 
 	return ReplaceEvent{DocumentKey: documentKey, FullDocument: doc}, nil
 }
