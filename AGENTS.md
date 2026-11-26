@@ -129,8 +129,6 @@ request titles and descriptions, comments, CI logs and workflow artifacts.
 - Keep everything generic. Describe a problem by its shape (a collection sharded on
   `{_id: "hashed", region: 1}`), not by where it was found. Use neutral placeholder names
   in code, tests, commit messages and pull requests.
-- Commit with an address that does not identify an employer, for example the
-  GitHub-provided `noreply` address.
 - When unsure whether something is private, leave it out.
 
 ### Regeneration
